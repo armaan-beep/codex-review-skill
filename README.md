@@ -1,8 +1,10 @@
 # Codex PR Review Loop
 
-A reusable Codex skill for repeatable PR review loops with verified findings, GitHub audit-trail comments, fresh-worktree closeout, and optional Crabbox remote proof runs.
+A reusable Codex skill for repeatable PR review loops with verified findings, GitHub audit-trail comments, fresh-worktree closeout, and optional but recommended Crabbox remote proof runs.
 
 The goal is simple: when you paste a PR into Codex and ask for review, Codex should inspect the code, inspect the PR conversation, verify comments from bots/humans, fix only real issues when asked, and leave a clear trail on GitHub.
+
+Inspired by Peter Steinberger's Codex autoreview and Crabbox review-loop setup, including his public [`codex-review` skill](https://github.com/steipete/agent-scripts/blob/main/skills/codex-review/SKILL.md).
 
 ## What It Does
 
@@ -13,7 +15,7 @@ The goal is simple: when you paste a PR into Codex and ask for review, Codex sho
 - Posts append-only GitHub comments for review runs, fixes, tests, Crabbox proof, cleanup, and final status.
 - Runs a bounded review/fix loop, with a default limit of five loops.
 - Uses a fresh local worktree for final PR closeout.
-- Uses Crabbox for optional remote clean-clone proof runs, including private repo support through your local GitHub token.
+- Uses Crabbox for optional but recommended remote clean-clone proof runs, including private repo support through your local GitHub token.
 - Cleans up local worktree metadata and Crabbox resources.
 
 ## How This Differs From Normal Review
@@ -27,9 +29,9 @@ This skill does not replace either of those. It wraps them into a repeatable PR 
 | --- | --- | --- |
 | `codex review` | Finding code-level regressions in a diff | PR comments, bot feedback, CI context, repeated fix/review loops |
 | CI / PR checks | Proving known commands still pass | Bugs not covered by tests, unclear PR discussion, false-positive bot comments |
-| This skill | Orchestrating the full review loop, including PR context, verified findings, focused tests, audit comments, fresh-worktree closeout, and optional remote proof | It still depends on good tests and human judgment for product/architecture decisions |
+| This skill | Orchestrating the full review loop, including PR context, verified findings, focused tests, audit comments, fresh-worktree closeout, and optional but recommended Crabbox remote proof | It still depends on good tests and human judgment for product/architecture decisions |
 
-In plain terms: `codex review` is the reviewer, CI is the test gate, and this skill is the process that makes sure review, comments, fixes, verification, and cleanup happen the same way every time.
+In plain terms: `codex review` is the reviewer, CI is the test gate, Crabbox is the optional clean remote machine, and this skill is the process that makes sure review, comments, fixes, verification, remote proof, and cleanup happen the same way every time.
 
 The loop matters. A normal review often stops after one pass: it finds issues, you fix them, and then someone has to remember to review again. This skill makes that explicit:
 
@@ -41,6 +43,8 @@ The loop matters. A normal review often stops after one pass: it finds issues, y
 6. repeat until clean or the loop limit is reached.
 
 The default loop limit is five, so the process cannot spin forever. If the limit is reached, the skill should say that clearly instead of pretending the PR is done.
+
+Crabbox is the other big difference. Instead of keeping Docker images, local VMs, database containers, or one-off test environments working on your laptop, the skill can ask Crabbox for a disposable cloud machine. That machine checks out the PR cleanly, runs the proof command you choose, reports the result, and is released afterward. This gives you a stronger "works from a clean machine" signal without turning every developer laptop into a mini CI farm.
 
 ## Requirements
 
@@ -194,7 +198,7 @@ Install and authenticate Crabbox separately, then verify:
 crabbox doctor
 ```
 
-Crabbox is optional. Without it, the skill still runs local review, PR context checks, focused tests, GitHub audit comments, and fresh-worktree closeout. Crabbox is only for the extra "prove this in a clean remote machine" step.
+Crabbox is optional but recommended. Without it, the skill still runs local review, PR context checks, focused tests, GitHub audit comments, and fresh-worktree closeout. Crabbox is only for the extra "prove this in a clean remote machine" step.
 
 The useful part is that Crabbox gives you a disposable remote machine for proof runs. You do not need to keep local Docker images, local VMs, database containers, or one-off test environments working on your laptop just to prove a PR in a clean environment. The helper can clone the PR on a fresh remote box, run the command you choose, collect the result, and release the box afterward.
 
