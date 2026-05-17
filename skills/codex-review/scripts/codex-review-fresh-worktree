@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: codex-review-fresh-worktree [options]
+
+Create a temporary clean git workspace for a PR/ref and run a final review or
+proof command there. Use this for final closeout so review is independent from
+the workspace used for iterative fixes.
+
+Options:
+  --pr PR             PR number or URL. Defaults to current branch PR when found.
+  --repo OWNER/REPO   GitHub repository. Defaults to the current repository.
+  --ref REF           Branch, tag, or SHA to review. Defaults to PR head/current branch.
+  --shell CMD         Command to run in the fresh worktree.
+  --github-comment    For the default command, post a GitHub audit comment.
+  --loop N            Audit loop number for the default command.
+  --keep              Keep the temporary worktree and print its path.
+  --dry-run           Print the selected worktree source and command; do not run.
+  -h, --help          Show help.
+
+Examples:
+  scripts/codex-review-fresh-worktree --pr 2519 --github-comment --loop 5
+  scripts/codex-review-fresh-worktree --pr 2519 --shell 'npm test'
+EOF
+}
+
+pr=
+repo=
+repo_explicit=false
+ref=
+ref_explicit=false
+head_fetch_ref=
+use_local_ref=false
+shell_cmd=
+github_comment=false
+loop=
+keep=false
+dry_run=false
+
+require_value() {
+  local option=$1
+  local value=${2-}
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "$option requires a value" >&2
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pr)
+      require_value "$1" "${2-}"
+      pr=$2
+      shift 2
+      ;;
+    --repo)
+      require_value "$1" "${2-}"
+      repo=$2
+      repo_explicit=true
+      shift 2
+      ;;
+    --ref)
+      require_value "$1" "${2-}"
+      ref=$2
+      ref_explicit=true
+      shift 2
+      ;;
+    --shell)
+      require_value "$1" "${2-}"
+      shell_cmd=$2
+      shift 2
+      ;;
+    --github-comment)
+      github_comment=true
+      shift
+      ;;
+    --loop)
+      require_value "$1" "${2-}"
+      loop=$2
+      shift 2
+      ;;
+    --keep)
+      keep=true
+      shift
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+
+review_helper_command() {
+  local name=$1
+  local helper
+  local helper_q
+
+  helper="$script_dir/$name"
+  if [[ -x "$helper" ]]; then
+    printf -v helper_q '%q' "$helper"
+    printf '%s\n' "$helper_q"
+    return 0
+  fi
+
+  if [[ -x "$repo_root/scripts/$name" ]]; then
+    printf 'scripts/%s\n' "$name"
+    return 0
+  fi
+
+  echo "missing helper: $name; install repo adapters or run from an installed codex-review skill" >&2
+  exit 1
+}
+
+repo_key() {
+  local repo=${1%.git}
+  printf '%s\n' "$repo" | tr '[:upper:]' '[:lower:]'
+}
+
+repo_from_remote_url() {
+  local url=${1%.git}
+  if [[ "$url" =~ ^https?://([^/@]+@)?github\.com/([^/]+)/([^/]+)$ ]]; then
+    printf '%s/%s\n' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  elif [[ "$url" =~ ^git@github\.com:([^/]+)/([^/]+)$ ]]; then
+    printf '%s/%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  elif [[ "$url" =~ ^ssh://git@github\.com/([^/]+)/([^/]+)$ ]]; then
+    printf '%s/%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  fi
+  return 0
+}
+
+repo_from_origin() {
+  local origin_url
+  origin_url=$(git remote get-url origin 2>/dev/null || true)
+  repo_from_remote_url "$origin_url"
+}
+
+remote_for_repo() {
+  local target_repo=$1
+  local target_key
+  local remote
+  local remote_url
+  local remote_repo
+
+  target_key=$(repo_key "$target_repo")
+  if remote_url=$(git remote get-url origin 2>/dev/null); then
+    remote_repo=$(repo_from_remote_url "$remote_url")
+    if [[ -n "$remote_repo" && "$(repo_key "$remote_repo")" == "$target_key" ]]; then
+      printf '%s\n' origin
+      return 0
+    fi
+  fi
+
+  while IFS= read -r remote; do
+    [[ -n "$remote" && "$remote" != origin ]] || continue
+    remote_url=$(git remote get-url "$remote" 2>/dev/null || true)
+    remote_repo=$(repo_from_remote_url "$remote_url")
+    if [[ -n "$remote_repo" && "$(repo_key "$remote_repo")" == "$target_key" ]]; then
+      printf '%s\n' "$remote"
+      return 0
+    fi
+  done < <(git remote 2>/dev/null || true)
+
+  return 1
+}
+
+remote_fetch_target() {
+  local remote=$1
+  local remote_url
+  remote_url=$(git remote get-url "$remote" 2>/dev/null || true)
+  if [[ -n "$remote_url" ]]; then
+    printf '%s\n' "$remote_url"
+  else
+    printf '%s\n' "$remote"
+  fi
+}
+
+have_gh=false
+if command -v gh >/dev/null 2>&1; then
+  have_gh=true
+fi
+
+origin_repo=$(repo_from_origin)
+local_ref_candidate=false
+if [[ "$ref_explicit" == true && -z "$pr" && ( "$repo_explicit" != true || "$repo" == current-checkout ) ]]; then
+  local_ref_candidate=true
+fi
+
+pr_url_repo=
+if [[ "$pr" =~ ^https?://github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+  pr_url_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+fi
+
+if [[ -z "$repo" && -n "$pr_url_repo" ]]; then
+  repo=$pr_url_repo
+fi
+
+if [[ -z "$repo" ]]; then
+  repo=$origin_repo
+fi
+
+if [[ -z "$repo" && "$have_gh" == true && "$local_ref_candidate" != true ]]; then
+  repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+fi
+
+if [[ -z "$pr" && -z "$ref" && "$have_gh" == true ]]; then
+  pr_guess=$(gh pr view --json number,url --jq '[.number, .url] | @tsv' 2>/dev/null || true)
+  if [[ -n "$pr_guess" ]]; then
+    IFS=$'\t' read -r pr_guess_number pr_guess_url <<< "$pr_guess"
+    pr=${pr_guess_url:-$pr_guess_number}
+    if [[ "$repo_explicit" != true && "$pr_guess_url" =~ ^https?://github\.com/([^/]+)/([^/]+)/pull/[0-9]+ ]]; then
+      repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    fi
+  elif [[ -n "$repo" ]]; then
+    pr=$(gh pr view --repo "$repo" --json number --jq .number 2>/dev/null || true)
+  fi
+fi
+
+pr_number=
+pr_url=
+base_ref_name=
+head_ref=
+head_repo=
+head_oid=
+
+if [[ -n "$pr" ]]; then
+  if [[ "$have_gh" != true ]]; then
+    echo "gh is required to resolve PR metadata; pass --ref and --shell for offline local-ref use" >&2
+    exit 1
+  fi
+  if [[ -z "$repo" && "$pr" != http://* && "$pr" != https://* ]]; then
+    echo "could not resolve GitHub repo; pass --repo OWNER/REPO" >&2
+    exit 1
+  fi
+  if [[ "$pr" != http://* && "$pr" != https://* ]]; then
+    pr_info=$(gh pr view "$pr" --repo "$repo" --json number,url,baseRefName,headRefName,headRefOid,headRepository --jq '[.number, .url, .baseRefName, .headRefName, .headRefOid, .headRepository.nameWithOwner] | @tsv') || {
+      echo "could not read PR metadata for $pr; check --repo/--pr and GitHub auth" >&2
+      exit 1
+    }
+  elif ! pr_info=$(gh pr view "$pr" --json number,url,baseRefName,headRefName,headRefOid,headRepository --jq '[.number, .url, .baseRefName, .headRefName, .headRefOid, .headRepository.nameWithOwner] | @tsv'); then
+    echo "could not read PR metadata for $pr; check --repo/--pr and GitHub auth" >&2
+    exit 1
+  fi
+  IFS=$'\t' read -r pr_number pr_url base_ref_name head_ref head_oid head_repo <<< "$pr_info"
+  if [[ -z "$ref" ]]; then
+    ref=$head_ref
+    head_fetch_ref="refs/heads/$head_ref"
+  elif [[ "$ref_explicit" != true && "$ref" == "$head_ref" ]]; then
+    head_fetch_ref="refs/heads/$head_ref"
+  fi
+fi
+
+if [[ -z "$ref" ]]; then
+  ref=$(git branch --show-current 2>/dev/null || true)
+  if [[ -n "$ref" ]]; then
+    head_fetch_ref="refs/heads/$ref"
+  fi
+fi
+
+if [[ -z "$ref" ]]; then
+  echo "could not resolve ref; pass --ref BRANCH_OR_SHA" >&2
+  exit 1
+fi
+if [[ "$local_ref_candidate" == true ]]; then
+  use_local_ref=true
+fi
+
+if [[ -z "$head_repo" ]]; then
+  head_repo=$repo
+fi
+
+if [[ -z "$repo" ]]; then
+  repo=current-checkout
+fi
+
+if [[ "$repo" == current-checkout || -z "$head_repo" ]]; then
+  head_fetch_remote=origin
+else
+  head_fetch_remote=$(remote_for_repo "$head_repo" || true)
+  if [[ -z "$head_fetch_remote" ]]; then
+    head_fetch_remote="https://github.com/$head_repo.git"
+  fi
+fi
+if [[ -z "$head_fetch_ref" ]]; then
+  head_fetch_ref=$ref
+fi
+
+base_fetch_remote=
+base_fetch_ref=
+base_review_ref=
+default_review_command=false
+if [[ -z "$shell_cmd" ]]; then
+  default_review_command=true
+fi
+if [[ "$default_review_command" == true && -z "$base_ref_name" && "$repo" != current-checkout ]]; then
+  if [[ "$have_gh" == true ]]; then
+    base_ref_name=$(gh repo view "$repo" --json defaultBranchRef --jq .defaultBranchRef.name 2>/dev/null || true)
+  fi
+  base_ref_name=${base_ref_name:-main}
+fi
+if [[ "$default_review_command" == true && -n "$base_ref_name" && "$repo" != current-checkout ]]; then
+  base_fetch_remote=$(remote_for_repo "$repo" || true)
+  if [[ -z "$base_fetch_remote" ]]; then
+    base_fetch_remote="https://github.com/$repo.git"
+  fi
+  base_fetch_ref="refs/codex-review/base/$base_ref_name"
+  base_review_ref=$base_fetch_ref
+fi
+
+if [[ -z "$shell_cmd" ]]; then
+  review_helper=$(review_helper_command codex-review)
+  context_helper=$(review_helper_command codex-review-pr-context)
+  review_cmd="$review_helper --mode branch"
+  if [[ -n "$base_review_ref" ]]; then
+    printf -v base_q '%q' "$base_review_ref"
+    review_cmd+=" --base $base_q"
+  elif [[ -n "$base_ref_name" ]]; then
+    printf -v base_q '%q' "origin/$base_ref_name"
+    review_cmd+=" --base $base_q"
+  fi
+  if [[ "$github_comment" == true ]]; then
+    if [[ -z "${pr_number:-}" ]]; then
+      echo "--github-comment requires a resolved PR; pass --pr or omit --github-comment" >&2
+      exit 2
+    fi
+    review_cmd+=" --github-comment"
+  fi
+  if [[ -n "$loop" ]]; then
+    printf -v loop_q '%q' "$loop"
+    review_cmd+=" --loop $loop_q"
+  fi
+  pr_target=${pr_url:-${pr_number:-}}
+  if [[ -n "$pr_target" ]]; then
+    printf -v pr_q '%q' "$pr_target"
+    shell_cmd="$context_helper --pr $pr_q --max-body-chars 1200 && $review_cmd --pr $pr_q"
+  else
+    shell_cmd="$review_cmd"
+  fi
+fi
+
+printf 'codex-review-fresh-worktree repo: %s\n' "$repo"
+if [[ "$use_local_ref" == true ]]; then
+  printf 'codex-review-fresh-worktree source: local %s\n' "$ref"
+else
+  printf 'codex-review-fresh-worktree source: %s %s\n' "$head_fetch_remote" "$head_fetch_ref"
+fi
+if [[ "$use_local_ref" != true && "$head_fetch_ref" != "$ref" ]]; then
+  printf 'codex-review-fresh-worktree checkout ref: %s\n' "$ref"
+fi
+if [[ -n "$base_ref_name" ]]; then
+  printf 'codex-review-fresh-worktree base: %s\n' "$base_ref_name"
+fi
+if [[ -n "$base_fetch_ref" ]]; then
+  printf 'codex-review-fresh-worktree base source: %s +refs/heads/%s:%s\n' "$base_fetch_remote" "$base_ref_name" "$base_fetch_ref"
+fi
+if [[ -n "${head_oid:-}" ]]; then
+  printf 'codex-review-fresh-worktree head: %s\n' "$head_oid"
+fi
+if [[ -n "${pr_url:-}" ]]; then
+  printf 'codex-review-fresh-worktree pr: %s\n' "$pr_url"
+fi
+printf 'codex-review-fresh-worktree command: %s\n' "$shell_cmd"
+
+if [[ "$dry_run" == true ]]; then
+  exit 0
+fi
+
+tmp_parent=$(mktemp -d)
+worktree_path="$tmp_parent/workspace"
+origin_url=$(git remote get-url origin 2>/dev/null || true)
+
+cleanup() {
+  cd "$repo_root" >/dev/null 2>&1 || true
+  if [[ "$keep" != true && -n "${tmp_parent:-}" ]]; then
+    rm -rf "$tmp_parent"
+  fi
+}
+trap cleanup EXIT
+
+git clone --shared --no-checkout "$repo_root" "$worktree_path" >/dev/null
+if [[ -n "$origin_url" ]]; then
+  git -C "$worktree_path" remote set-url origin "$origin_url"
+fi
+
+if [[ -n "$base_fetch_ref" ]]; then
+  base_fetch_remote=$(remote_fetch_target "$base_fetch_remote")
+  git -C "$worktree_path" fetch --quiet "$base_fetch_remote" "+refs/heads/$base_ref_name:$base_fetch_ref"
+fi
+if [[ "$use_local_ref" == true ]]; then
+  git -C "$worktree_path" checkout --detach "$ref" >/dev/null
+else
+  head_fetch_remote=$(remote_fetch_target "$head_fetch_remote")
+  git -C "$worktree_path" fetch --quiet "$head_fetch_remote" "$head_fetch_ref"
+  git -C "$worktree_path" checkout --detach FETCH_HEAD >/dev/null
+fi
+
+printf 'codex-review-fresh-worktree path: %s\n' "$worktree_path"
+(
+  cd "$worktree_path"
+  bash -lc "$shell_cmd"
+)
+
+if [[ "$keep" == true ]]; then
+  printf 'codex-review-fresh-worktree kept: %s\n' "$worktree_path"
+fi

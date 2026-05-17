@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/install-skill [options]
+
+Install the codex-review skill into the local Codex skills directory.
+
+Options:
+  --target DIR  Exact target directory. Default:
+                ${CODEX_HOME:-$HOME/.codex}/skills/codex-review
+  --force       Replace an existing target directory.
+  -h, --help    Show help.
+EOF
+}
+
+target="${CODEX_HOME:-$HOME/.codex}/skills/codex-review"
+force=false
+
+require_value() {
+  local option=$1
+  local value=${2-}
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "$option requires a value" >&2
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target)
+      require_value "$1" "${2-}"
+      target=$2
+      shift 2
+      ;;
+    --force)
+      force=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd "$script_dir/.." && pwd -P)
+source_dir="$repo_root/skills/codex-review"
+
+if [[ ! -f "$source_dir/SKILL.md" ]]; then
+  echo "could not find source skill at $source_dir" >&2
+  exit 1
+fi
+
+if [[ -e "$target" ]]; then
+  if [[ "$force" != true ]]; then
+    echo "target already exists: $target" >&2
+    echo "rerun with --force to replace it" >&2
+    exit 1
+  fi
+  rm -rf "$target"
+fi
+
+mkdir -p "$(dirname "$target")"
+cp -R "$source_dir" "$target"
+chmod +x "$target"/scripts/* 2>/dev/null || true
+
+printf 'Installed codex-review skill to %s\n' "$target"
+printf 'Restart Codex so it reloads the skill list.\n'

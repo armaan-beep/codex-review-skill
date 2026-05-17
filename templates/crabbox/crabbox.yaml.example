@@ -1,0 +1,14 @@
+# Example Crabbox config for repositories that want remote proof results.
+# Copy to .crabbox.yaml in your project and adjust for your provider/repo.
+
+provider: hetzner
+
+results:
+  junit:
+    - test-results/codex-crabbox-proof.xml
+    - test-results/junit.xml
+    - junit.xml
+
+sync:
+  ignore:
+    - .crabboxignore

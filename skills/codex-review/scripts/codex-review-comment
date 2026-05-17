@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: codex-review-comment [options]
+
+Post a standardized Codex review audit-trail comment to the current GitHub PR.
+
+Options:
+  --phase NAME        Event phase: review, changes, tests, crabbox, cleanup, final, blocked.
+  --status STATUS     Short status label, such as clean, findings, fixed, failed.
+  --loop N            Review loop number.
+  --title TEXT        Optional display title.
+  --body-file FILE    Markdown body to append after the metadata block. Reads stdin if omitted.
+  --pr PR             PR number, URL, or branch. Defaults to current branch PR.
+  --dry-run           Print the comment instead of posting it.
+  -h, --help          Show help.
+EOF
+}
+
+phase=
+status=
+loop=
+title=
+body_file=
+pr=
+dry_run=false
+
+require_value() {
+  local option=$1
+  local value=${2-}
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "$option requires a value" >&2
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --phase)
+      require_value "$1" "${2-}"
+      phase=$2
+      shift 2
+      ;;
+    --status)
+      require_value "$1" "${2-}"
+      status=$2
+      shift 2
+      ;;
+    --loop)
+      require_value "$1" "${2-}"
+      loop=$2
+      shift 2
+      ;;
+    --title)
+      require_value "$1" "${2-}"
+      title=$2
+      shift 2
+      ;;
+    --body-file)
+      require_value "$1" "${2-}"
+      body_file=$2
+      shift 2
+      ;;
+    --pr)
+      require_value "$1" "${2-}"
+      pr=$2
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$phase" ]]; then
+  echo "--phase is required" >&2
+  exit 2
+fi
+
+if [[ -z "$status" ]]; then
+  echo "--status is required" >&2
+  exit 2
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+branch=$(git branch --show-current 2>/dev/null || true)
+commit=$(git rev-parse --short HEAD)
+timestamp=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
+
+if [[ -z "$pr" ]]; then
+  if command -v gh >/dev/null 2>&1; then
+    pr=$(gh pr view --json number --jq .number 2>/dev/null || true)
+  fi
+fi
+
+if [[ -z "$pr" && "$dry_run" != true ]]; then
+  echo "could not resolve current GitHub PR; pass --pr or run on a PR branch" >&2
+  exit 1
+fi
+
+body_temp=
+if [[ -z "$body_file" ]]; then
+  body_temp=$(mktemp)
+  cat > "$body_temp"
+  body_file=$body_temp
+fi
+
+comment_file=$(mktemp)
+cleanup() {
+  rm -f "$comment_file"
+  if [[ -n "${body_temp:-}" ]]; then
+    rm -f "$body_temp"
+  fi
+}
+trap cleanup EXIT
+
+display_title=${title:-"Codex review ${phase}"}
+if [[ -n "$loop" ]]; then
+  display_title="Codex review loop ${loop}: ${display_title}"
+fi
+
+{
+  printf '<!-- codex-review-audit phase="%s" status="%s" loop="%s" branch="%s" commit="%s" time="%s" -->\n\n' "$phase" "$status" "${loop:-}" "${branch:-detached}" "$commit" "$timestamp"
+  printf '### %s\n\n' "$display_title"
+  printf -- "- Phase: \`%s\`\n" "$phase"
+  printf -- "- Status: \`%s\`\n" "$status"
+  printf -- "- Branch: \`%s\`\n" "${branch:-detached}"
+  printf -- "- Commit: \`%s\`\n" "$commit"
+  printf -- "- Time: \`%s\`\n\n" "$timestamp"
+  cat "$body_file"
+} > "$comment_file"
+
+if [[ "$dry_run" == true ]]; then
+  cat "$comment_file"
+  exit 0
+fi
+
+cd "$repo_root"
+gh pr comment "$pr" --body-file "$comment_file"

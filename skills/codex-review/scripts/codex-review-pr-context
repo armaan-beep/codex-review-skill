@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: codex-review-pr-context [options]
+
+Print GitHub pull request context for a review loop, including PR metadata,
+status checks, top-level comments, reviews, inline comments, and review threads.
+
+Options:
+  --pr PR             PR number, URL, or branch. Defaults to current branch PR.
+  --repo OWNER/REPO   GitHub repository. Defaults to the current repository.
+  --max-body-chars N  Maximum body characters per comment/review. Default: 4000.
+  -h, --help          Show help.
+EOF
+}
+
+pr=
+repo=
+max_body_chars=4000
+
+require_value() {
+  local option=$1
+  local value=${2-}
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "$option requires a value" >&2
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pr)
+      require_value "$1" "${2-}"
+      pr=$2
+      shift 2
+      ;;
+    --repo)
+      require_value "$1" "${2-}"
+      repo=$2
+      shift 2
+      ;;
+    --max-body-chars)
+      require_value "$1" "${2-}"
+      max_body_chars=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$max_body_chars" in
+  ''|*[!0-9]*)
+    echo "--max-body-chars must be a positive integer" >&2
+    exit 2
+    ;;
+esac
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "gh is required to read GitHub PR context" >&2
+  exit 1
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+if [[ "$pr" =~ ^https?://github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+  pr_url_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+  pr_url_number="${BASH_REMATCH[3]}"
+  if [[ -z "$repo" ]]; then
+    repo=$pr_url_repo
+  fi
+  pr=$pr_url_number
+fi
+
+if [[ -z "$pr" ]]; then
+  if [[ -z "$repo" ]]; then
+    pr_info=$(gh pr view --json number,url --jq '[.number, .url] | @tsv' 2>/dev/null || true)
+    if [[ -n "$pr_info" ]]; then
+      pr=${pr_info%%$'\t'*}
+      pr_url=${pr_info#*$'\t'}
+      if [[ "$pr_url" =~ ^https?://github\.com/([^/]+)/([^/]+)/pull/[0-9]+ ]]; then
+        repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+      fi
+    fi
+  fi
+  if [[ -z "$repo" ]]; then
+    repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+  fi
+  if [[ -z "$pr" ]]; then
+    pr=$(gh pr view --repo "$repo" --json number --jq .number)
+  fi
+elif [[ -z "$repo" ]]; then
+  repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+fi
+
+pr_number=$(gh pr view "$pr" --repo "$repo" --json number --jq .number)
+owner=${repo%%/*}
+name=${repo#*/}
+
+truncate_jq='def trunc($n): (. // "") as $s | if ($s | length) > $n then ($s[0:$n] + "\n[truncated]") else $s end;'
+
+printf '# GitHub PR Context\n\n'
+printf -- '- Repo: `%s`\n' "$repo"
+printf -- '- PR: `%s`\n' "$pr_number"
+printf -- '- Generated: `%s`\n\n' "$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+
+printf '## PR\n\n'
+gh pr view "$pr_number" \
+  --repo "$repo" \
+  --json title,url,author,baseRefName,headRefName,reviewDecision,body \
+  --jq "${truncate_jq}"'
+"- Title: " + .title,
+"- URL: " + .url,
+"- Author: @" + .author.login,
+"- Base: " + .baseRefName,
+"- Head: " + .headRefName,
+"- Review decision: " + ((.reviewDecision // "UNKNOWN") | tostring),
+"\n### Body\n\n" + (.body | trunc('"$max_body_chars"'))
+'
+
+printf '\n## Status Checks\n\n'
+gh pr view "$pr_number" \
+  --repo "$repo" \
+  --json statusCheckRollup \
+  --jq '.statusCheckRollup[]? | "- " + ((.name // .context // "unknown") | tostring) + ": " + ((.status // .state // "unknown") | tostring) + if (.conclusion // "") == "" then "" else " / " + (.conclusion | tostring) end' || true
+
+printf '\n## Reviews\n\n'
+if ! gh api --paginate "repos/$repo/pulls/$pr_number/reviews" \
+  --jq "${truncate_jq}"'.[] | "### Review by @" + .user.login + " - " + .state + " - " + .submitted_at + "\n" + .html_url + "\n\n" + (.body | trunc('"$max_body_chars"')) + "\n"' ; then
+  printf 'Could not read reviews.\n'
+fi
+
+printf '\n## Top-Level Comments\n\n'
+if ! gh api --paginate "repos/$repo/issues/$pr_number/comments" \
+  --jq "${truncate_jq}"'.[] | "### Comment by @" + .user.login + " - " + .created_at + "\n" + .html_url + "\n\n" + (.body | trunc('"$max_body_chars"')) + "\n"' ; then
+  printf 'Could not read top-level comments.\n'
+fi
+
+printf '\n## Inline Review Comments\n\n'
+if ! gh api --paginate "repos/$repo/pulls/$pr_number/comments" \
+  --jq "${truncate_jq}"'.[] | "### Inline by @" + .user.login + " - " + .created_at + "\n" + .html_url + "\n`" + .path + ":" + (((.line // .original_line // 0) | tostring)) + "`\n\n" + (.body | trunc('"$max_body_chars"')) + "\n"' ; then
+  printf 'Could not read inline review comments.\n'
+fi
+
+printf '\n## Review Threads\n\n'
+if ! gh api graphql \
+  --paginate \
+  -f owner="$owner" \
+  -f name="$name" \
+  -F number="$pr_number" \
+  -f query='
+	query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+	  repository(owner: $owner, name: $name) {
+	    pullRequest(number: $number) {
+	      reviewThreads(first: 100, after: $endCursor) {
+	        pageInfo {
+	          hasNextPage
+	          endCursor
+	        }
+	        nodes {
+	          isResolved
+	          path
+	          line
+	          comments(first: 100) {
+	            pageInfo {
+	              hasNextPage
+	            }
+	            nodes {
+	              author { login }
+	              body
+              url
+              createdAt
+            }
+          }
+        }
+      }
+    }
+  }
+}' \
+  --jq "${truncate_jq}"'
+	.data.repository.pullRequest.reviewThreads.nodes[]? |
+	"### Thread on `" + .path + ":" + ((.line // 0) | tostring) + "` - resolved=" + (.isResolved | tostring) + "\n" +
+	(
+	  .comments.nodes[] |
+	  "- @" + (.author.login // "unknown") + " - " + .createdAt + "\n  " + .url + "\n\n" + (.body | trunc('"$max_body_chars"')) + "\n"
+	) +
+	(if .comments.pageInfo.hasNextPage then "\n[thread comments truncated after 100 comments]\n" else "" end)
+	' ; then
+  printf 'Could not read review threads.\n'
+fi

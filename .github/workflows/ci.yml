@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Bash syntax
+        run: |
+          set -euo pipefail
+          find scripts skills/codex-review/scripts -type f -print0 | xargs -0 -n1 bash -n
+      - name: Shellcheck
+        run: shellcheck scripts/install-skill scripts/install-repo-adapter skills/codex-review/scripts/*
+      - name: Installer smoke
+        run: |
+          set -euo pipefail
+          scripts/install-skill --target "$RUNNER_TEMP/codex-home/skills/codex-review" --force
+          mkdir -p "$RUNNER_TEMP/sample-repo"
+          git -C "$RUNNER_TEMP/sample-repo" init
+          scripts/install-repo-adapter --repo "$RUNNER_TEMP/sample-repo" --force
+          git -C "$RUNNER_TEMP/sample-repo" add scripts
+          CODEX_HOME="$RUNNER_TEMP/codex-home" "$RUNNER_TEMP/sample-repo/scripts/codex-review-preflight" --all --dry-run

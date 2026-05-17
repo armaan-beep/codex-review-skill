@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: crabbox-pr-proof [options]
+
+Run a proof command in a fresh Crabbox machine that clones the PR branch
+directly from GitHub using the local gh token. This is useful for private repos
+when the Crabbox broker or GitHub Actions hydration is unavailable.
+
+Options:
+  --pr PR             PR number or URL. Defaults to current branch PR when found.
+  --repo OWNER/REPO   GitHub repository. Defaults to PR head repo or gh repo view.
+  --ref REF           Branch, tag, or SHA to checkout. Defaults to PR/current branch.
+  --shell CMD         Command to run after checkout. Defaults to a tooling smoke test.
+  --python-bootstrap  Create a remote Python venv and install Python deps before CMD.
+  --no-python-bootstrap
+                      Disable automatic Python bootstrap for Python-looking CMDs.
+  --class CLASS       Crabbox class to request.
+  --type TYPE         Provider machine type to request.
+  --keep              Keep the lease after the command.
+  --dry-run           Print the selected command without running it.
+  -h, --help          Show help.
+
+Examples:
+  scripts/crabbox-pr-proof --pr 123 --python-bootstrap --shell 'pytest tests/foo.py -q'
+  scripts/crabbox-pr-proof --ref my-branch --no-python-bootstrap --shell 'npm run build'
+EOF
+}
+
+repo=
+ref=
+ref_explicit=false
+fetch_ref=
+pr=
+proof_shell=
+crabbox_class=
+machine_type=
+keep=false
+dry_run=false
+python_bootstrap=auto
+
+require_value() {
+  local option=$1
+  local value=${2-}
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "$option requires a value" >&2
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pr)
+      require_value "$1" "${2-}"
+      pr=$2
+      shift 2
+      ;;
+    --repo)
+      require_value "$1" "${2-}"
+      repo=$2
+      shift 2
+      ;;
+    --ref)
+      require_value "$1" "${2-}"
+      ref=$2
+      ref_explicit=true
+      shift 2
+      ;;
+    --shell)
+      require_value "$1" "${2-}"
+      proof_shell=$2
+      shift 2
+      ;;
+    --python-bootstrap)
+      python_bootstrap=always
+      shift
+      ;;
+    --no-python-bootstrap)
+      python_bootstrap=never
+      shift
+      ;;
+    --class)
+      require_value "$1" "${2-}"
+      crabbox_class=$2
+      shift 2
+      ;;
+    --type)
+      require_value "$1" "${2-}"
+      machine_type=$2
+      shift 2
+      ;;
+    --keep)
+      keep=true
+      shift
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+if [[ "$dry_run" != true ]] && ! command -v crabbox >/dev/null 2>&1; then
+  echo "crabbox is required" >&2
+  exit 1
+fi
+
+have_gh=false
+if command -v gh >/dev/null 2>&1; then
+  have_gh=true
+fi
+
+if [[ -z "$pr" && -z "$ref" && "$have_gh" == true ]]; then
+  pr=$(gh pr view --json number --jq .number 2>/dev/null || true)
+fi
+
+if [[ -n "$pr" ]]; then
+  if [[ "$have_gh" != true ]]; then
+    echo "gh is required to resolve --pr; pass --repo and --ref instead" >&2
+    exit 1
+  fi
+  if [[ -n "$repo" ]]; then
+    pr_info=$(gh pr view "$pr" --repo "$repo" --json headRefName,headRepository --jq '.headRepository.nameWithOwner + "\t" + .headRefName') || {
+      echo "could not read PR metadata for $pr; check --repo/--pr and GitHub auth" >&2
+      exit 1
+    }
+  elif ! pr_info=$(gh pr view "$pr" --json headRefName,headRepository --jq '.headRepository.nameWithOwner + "\t" + .headRefName'); then
+    echo "could not read PR metadata for $pr; check --repo/--pr and GitHub auth" >&2
+    exit 1
+  fi
+  pr_repo=${pr_info%%$'\t'*}
+  pr_ref=${pr_info#*$'\t'}
+  if [[ -z "$repo" || -z "$ref" ]]; then
+    repo=$pr_repo
+  fi
+  if [[ -z "$ref" ]]; then
+    ref=$pr_ref
+    fetch_ref="refs/heads/$pr_ref"
+  elif [[ "$ref_explicit" != true && "$ref" == "$pr_ref" ]]; then
+    fetch_ref="refs/heads/$pr_ref"
+  fi
+fi
+
+if [[ -z "$repo" && "$have_gh" == true ]]; then
+  repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+fi
+
+if [[ -z "$ref" ]]; then
+  ref=$(git branch --show-current 2>/dev/null || true)
+  if [[ -n "$ref" ]]; then
+    fetch_ref="refs/heads/$ref"
+  fi
+fi
+
+if [[ -z "$repo" || "$repo" != */* ]]; then
+  echo "could not resolve GitHub repo; pass --repo OWNER/REPO" >&2
+  exit 1
+fi
+
+if [[ -z "$ref" ]]; then
+  echo "could not resolve ref; pass --ref BRANCH_OR_SHA" >&2
+  exit 1
+fi
+if [[ -z "$fetch_ref" ]]; then
+  fetch_ref=$ref
+fi
+
+if [[ -z "$proof_shell" ]]; then
+  proof_shell='git rev-parse --show-toplevel >/dev/null && git status --short && git log -1 --oneline && printf "CODEX_REVIEW_CRABBOX_CLONE_OK\n"'
+fi
+
+python_bootstrap_remote=false
+if [[ "$python_bootstrap" == always ]]; then
+  python_bootstrap_remote=true
+elif [[ "$python_bootstrap" == auto ]]; then
+  if [[ "$proof_shell" == *pytest* || "$proof_shell" == *ruff* || "$proof_shell" == *mypy* || "$proof_shell" == *python* ]]; then
+    python_bootstrap_remote=true
+  fi
+fi
+
+printf -v repo_q '%q' "$repo"
+printf -v fetch_ref_q '%q' "$fetch_ref"
+printf -v proof_shell_q '%q' "$proof_shell"
+printf -v keep_q '%q' "$keep"
+printf -v python_bootstrap_q '%q' "$python_bootstrap_remote"
+
+remote_script_template=$(mktemp)
+cat > "$remote_script_template" <<'EOF'
+set -euo pipefail
+if [ -z "${GH_TOKEN:-}" ]; then
+  echo "GH_TOKEN was not forwarded" >&2
+  exit 1
+fi
+
+repo=__CRABBOX_REPO__
+fetch_ref=__CRABBOX_FETCH_REF__
+proof_shell=__CRABBOX_PROOF_SHELL__
+keep_remote=__CRABBOX_KEEP_REMOTE__
+python_bootstrap=__CRABBOX_PYTHON_BOOTSTRAP__
+proof_nonce=__CRABBOX_PROOF_NONCE__
+python_venv=/tmp/codex-review-proof-venv
+initial_dir=$(pwd)
+
+workdir="$initial_dir/crabbox-pr-proof"
+rm -rf "$workdir"
+mkdir -p "$workdir"
+cleanup() {
+  if [ "$keep_remote" != true ]; then
+    cd "$initial_dir" 2>/dev/null || true
+    rm -rf "$workdir"
+  fi
+}
+trap cleanup EXIT
+
+cat > "$workdir/askpass.sh" <<'ASKPASS'
+#!/usr/bin/env sh
+case "$1" in
+  *Username*) printf "%s\n" "x-access-token" ;;
+  *Password*) printf "%s\n" "$GH_TOKEN" ;;
+  *) printf "%s\n" "$GH_TOKEN" ;;
+esac
+ASKPASS
+chmod 700 "$workdir/askpass.sh"
+
+export GIT_ASKPASS="$workdir/askpass.sh"
+export GIT_TERMINAL_PROMPT=0
+
+repo_dir="$workdir/repo"
+git clone --filter=blob:none --no-tags "https://github.com/$repo.git" "$repo_dir"
+cd "$repo_dir"
+git fetch --filter=blob:none origin "$fetch_ref"
+git checkout --detach FETCH_HEAD
+git log -1 --oneline
+
+unset GH_TOKEN GITHUB_TOKEN GIT_ASKPASS
+rm -f "$workdir/askpass.sh"
+
+if [ "$python_bootstrap" = true ]; then
+  printf 'crabbox-pr-proof python bootstrap: start\n'
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required for --python-bootstrap" >&2
+    exit 127
+  fi
+  rm -rf "$python_venv"
+  if ! python3 -m venv "$python_venv"; then
+    if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+      sudo DEBIAN_FRONTEND=noninteractive apt-get update
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv python3-pip
+    else
+      echo "python3 venv support is missing and apt-get/sudo is unavailable" >&2
+      exit 127
+    fi
+    rm -rf "$python_venv"
+    python3 -m venv "$python_venv"
+  fi
+  . "$python_venv/bin/activate"
+  python -m pip --version >/dev/null 2>&1 || python -m ensurepip --upgrade
+  python -m pip install -U pip
+  req_file=
+  if [ -f requirements.txt ]; then
+    req_file=requirements.txt
+  else
+    req_file=$(find . -maxdepth 3 -name requirements.txt -not -path '*/.venv/*' -print | head -n 1 || true)
+    req_file=${req_file#./}
+  fi
+  if [ -n "$req_file" ]; then
+    python -m pip install -r "$req_file"
+  fi
+  python -m pip install pytest ruff mypy
+  python -V
+  printf 'crabbox-pr-proof python bootstrap: ready\n'
+fi
+
+if [ "$keep_remote" = true ]; then
+  printf 'crabbox-pr-proof remote workdir kept: %s\n' "$workdir"
+fi
+
+proof_script="$workdir/proof.sh"
+if [ "$python_bootstrap" = true ]; then
+  {
+    printf '. %q/bin/activate\n' "$python_venv"
+    printf '%s\n' "$proof_shell"
+  } > "$proof_script"
+else
+  printf '%s\n' "$proof_shell" > "$proof_script"
+fi
+chmod 700 "$proof_script"
+
+xml_escape() {
+  sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\&apos;/g"
+}
+
+start_time=$(date +%s)
+set +e
+bash --login "$proof_script"
+proof_status=$?
+set -e
+end_time=$(date +%s)
+duration=$((end_time - start_time))
+
+mkdir -p "$initial_dir/test-results"
+status_path="$initial_dir/test-results/codex-crabbox-proof.status"
+printf 'nonce=%s\nstatus=%s\n' "$proof_nonce" "$proof_status" > "$status_path"
+printf 'crabbox-pr-proof trusted status: nonce=%s status=%s\n' "$proof_nonce" "$proof_status"
+escaped_command=$(printf '%s' "$proof_shell" | xml_escape)
+if [ "$proof_status" -eq 0 ]; then
+  cat > "$initial_dir/test-results/codex-crabbox-proof.xml" <<JUNIT
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="codex-crabbox-proof" tests="1" failures="0" errors="0" skipped="0" time="$duration">
+  <testcase classname="codex.crabbox" name="proof-command" time="$duration">
+    <system-out>$escaped_command</system-out>
+  </testcase>
+</testsuite>
+JUNIT
+  printf 'crabbox-pr-proof trusted junit: nonce=%s tests=1 failures=0 errors=0\n' "$proof_nonce"
+else
+  cat > "$initial_dir/test-results/codex-crabbox-proof.xml" <<JUNIT
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="codex-crabbox-proof" tests="1" failures="1" errors="0" skipped="0" time="$duration">
+  <testcase classname="codex.crabbox" name="proof-command" time="$duration">
+    <failure message="proof command exited with status $proof_status">$escaped_command</failure>
+  </testcase>
+</testsuite>
+JUNIT
+  printf 'crabbox-pr-proof trusted junit: nonce=%s tests=1 failures=1 errors=0\n' "$proof_nonce"
+fi
+printf 'crabbox-pr-proof junit: %s\n' "$initial_dir/test-results/codex-crabbox-proof.xml"
+
+for junit_path in test-results/junit.xml junit.xml */junit.xml; do
+  if [ -f "$junit_path" ]; then
+    mkdir -p "$initial_dir/$(dirname "$junit_path")"
+    cp "$junit_path" "$initial_dir/$junit_path"
+    printf 'crabbox-pr-proof junit copied: %s\n' "$junit_path"
+  fi
+done
+
+printf 'crabbox-pr-proof proof exit: %s\n' "$proof_status"
+cd "$initial_dir"
+exit "$proof_status"
+EOF
+remote_script=$(<"$remote_script_template")
+rm -f "$remote_script_template"
+if command -v openssl >/dev/null 2>&1; then
+  proof_nonce=$(openssl rand -hex 16)
+elif command -v uuidgen >/dev/null 2>&1; then
+  proof_nonce=$(uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-')
+else
+  proof_nonce="$(date +%s)-$$-$RANDOM"
+fi
+printf -v proof_nonce_q '%q' "$proof_nonce"
+remote_script=${remote_script/__CRABBOX_REPO__/$repo_q}
+remote_script=${remote_script/__CRABBOX_FETCH_REF__/$fetch_ref_q}
+remote_script=${remote_script/__CRABBOX_PROOF_SHELL__/$proof_shell_q}
+remote_script=${remote_script/__CRABBOX_KEEP_REMOTE__/$keep_q}
+remote_script=${remote_script/__CRABBOX_PYTHON_BOOTSTRAP__/$python_bootstrap_q}
+remote_script=${remote_script/__CRABBOX_PROOF_NONCE__/$proof_nonce_q}
+
+crabbox_args=(run --no-sync --allow-env GH_TOKEN)
+if [[ -n "$crabbox_class" ]]; then
+  crabbox_args+=(--class "$crabbox_class")
+fi
+if [[ -n "$machine_type" ]]; then
+  crabbox_args+=(--type "$machine_type")
+fi
+if [[ "$keep" == true ]]; then
+  crabbox_args+=(--keep)
+fi
+crabbox_args+=(--shell "$remote_script")
+
+printf 'crabbox-pr-proof repo: %s\n' "$repo"
+printf 'crabbox-pr-proof ref: %s\n' "$ref"
+if [[ "$fetch_ref" != "$ref" ]]; then
+  printf 'crabbox-pr-proof fetch ref: %s\n' "$fetch_ref"
+fi
+printf 'crabbox-pr-proof command: %s\n' "$proof_shell"
+printf 'crabbox-pr-proof mode: remote GitHub clean clone with secret GH_TOKEN\n'
+printf 'crabbox-pr-proof python bootstrap: %s\n' "$python_bootstrap_remote"
+
+if [[ "$dry_run" == true ]]; then
+  printf 'crabbox'
+  printf ' %q' "${crabbox_args[@]}"
+  printf '\n'
+  exit 0
+fi
+
+github_token=${GH_TOKEN:-${GITHUB_TOKEN:-}}
+if [[ -z "$github_token" ]]; then
+  if [[ "$have_gh" != true ]]; then
+    echo "gh is required so the remote Crabbox machine can authenticate to GitHub" >&2
+    exit 1
+  fi
+  github_token=$(gh auth token)
+fi
+
+if [[ -z "$github_token" ]]; then
+  echo "could not get a GitHub token from GH_TOKEN, GITHUB_TOKEN, or gh auth token" >&2
+  exit 1
+fi
+
+run_output=$(mktemp)
+# shellcheck disable=SC2317,SC2329
+cleanup_local() {
+  rm -f "$run_output"
+}
+trap cleanup_local EXIT
+
+set +e
+GH_TOKEN=$github_token crabbox "${crabbox_args[@]}" 2>&1 | tee "$run_output"
+crabbox_status=${PIPESTATUS[0]}
+set -e
+
+trusted_status_line="crabbox-pr-proof trusted status: nonce=$proof_nonce status=0"
+trusted_junit_line="crabbox-pr-proof trusted junit: nonce=$proof_nonce tests=1 failures=0 errors=0"
+if [[ "$crabbox_status" != 0 ]] &&
+  grep -Fxq "$trusted_status_line" "$run_output" &&
+  grep -Fxq "$trusted_junit_line" "$run_output"; then
+  echo "warning: crabbox returned $crabbox_status after a passing proof and passing JUnit results; treating proof as successful" >&2
+  exit 0
+fi
+
+exit "$crabbox_status"

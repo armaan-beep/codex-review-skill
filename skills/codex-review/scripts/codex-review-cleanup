@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: codex-review-cleanup [options]
+
+Report and clean up review resources after a Codex review loop. The helper is
+conservative: it does not delete unrelated worktree directories and only stops
+Crabbox leases named explicitly on the command line.
+
+Options:
+  --dry-run                 Print cleanup actions without mutating anything.
+  --prune-worktrees         Run git worktree prune for stale worktree metadata.
+  --worktree-expire TIME    Expiry for stale worktree metadata. Default: now.
+  --crabbox-list            List active Crabbox machines/leases.
+  --crabbox-cleanup         Run crabbox cleanup for expired direct-provider state.
+  --crabbox-stop ID         Stop/release a known Crabbox lease; may be repeated.
+  --require-clean-current   Fail if the current worktree has uncommitted changes.
+  -h, --help                Show help.
+
+Examples:
+  scripts/codex-review-cleanup --dry-run --crabbox-list
+  scripts/codex-review-cleanup --prune-worktrees --crabbox-stop review-lease-123
+EOF
+}
+
+dry_run=false
+prune_worktrees=false
+worktree_expire=now
+crabbox_list=false
+crabbox_cleanup=false
+require_clean_current=false
+crabbox_stop_ids=()
+
+require_value() {
+  local option=$1
+  local value=${2-}
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "$option requires a value" >&2
+    exit 2
+  fi
+}
+
+print_command() {
+  printf '+'
+  printf ' %q' "$@"
+  printf '\n'
+}
+
+run_or_print() {
+  if [[ "$dry_run" == true ]]; then
+    printf 'dry-run: '
+    print_command "$@"
+  else
+    print_command "$@"
+    "$@"
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    --prune-worktrees)
+      prune_worktrees=true
+      shift
+      ;;
+    --worktree-expire)
+      require_value "$1" "${2-}"
+      worktree_expire=$2
+      shift 2
+      ;;
+    --crabbox-list)
+      crabbox_list=true
+      shift
+      ;;
+    --crabbox-cleanup)
+      crabbox_cleanup=true
+      shift
+      ;;
+    --crabbox-stop)
+      require_value "$1" "${2-}"
+      crabbox_stop_ids+=("$2")
+      shift 2
+      ;;
+    --require-clean-current)
+      require_clean_current=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+printf 'codex-review-cleanup repo: %s\n' "$repo_root"
+
+current_status=$(git status --porcelain)
+if [[ -z "$current_status" ]]; then
+  printf 'current worktree: clean\n'
+else
+  printf 'current worktree: dirty\n'
+  printf '%s\n' "$current_status"
+  if [[ "$require_clean_current" == true ]]; then
+    echo "current worktree must be clean before final closeout" >&2
+    exit 1
+  fi
+fi
+
+printf '\nworktree prune preview:\n'
+worktree_preview=$(git worktree prune -n -v --expire "$worktree_expire" 2>&1 || true)
+if [[ -n "$worktree_preview" ]]; then
+  printf '%s\n' "$worktree_preview"
+else
+  printf 'no stale worktree metadata reported\n'
+fi
+
+if [[ "$prune_worktrees" == true ]]; then
+  printf '\nworktree prune:\n'
+  if [[ "$dry_run" == true ]]; then
+    printf 'dry-run: '
+    print_command git worktree prune -v --expire "$worktree_expire"
+  else
+    run_or_print git worktree prune -v --expire "$worktree_expire"
+  fi
+else
+  printf '\nworktree prune: skipped; pass --prune-worktrees to apply stale metadata pruning\n'
+fi
+
+if [[ "$crabbox_list" == true || "$crabbox_cleanup" == true || ${#crabbox_stop_ids[@]} -gt 0 ]]; then
+  if ! command -v crabbox >/dev/null 2>&1; then
+    echo "crabbox: unavailable" >&2
+    exit 1
+  fi
+fi
+
+if [[ "$crabbox_list" == true ]]; then
+  printf '\ncrabbox list:\n'
+  crabbox_output=$(crabbox list 2>&1 || true)
+  if [[ -n "$crabbox_output" ]]; then
+    printf '%s\n' "$crabbox_output"
+  else
+    printf 'no active Crabbox machines listed\n'
+  fi
+fi
+
+if (( ${#crabbox_stop_ids[@]} > 0 )); then
+  printf '\ncrabbox stop:\n'
+  for crabbox_id in "${crabbox_stop_ids[@]}"; do
+    run_or_print crabbox stop "$crabbox_id"
+  done
+fi
+
+if [[ "$crabbox_cleanup" == true ]]; then
+  printf '\ncrabbox cleanup:\n'
+  run_or_print crabbox cleanup
+fi
+
+printf '\ncodex-review-cleanup complete\n'

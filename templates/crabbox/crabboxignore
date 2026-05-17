@@ -1,0 +1,33 @@
+# Local secrets and machine-only state.
+.env
+.env.*
+!.env.example
+!**/.env.example
+.secrets
+.local/
+
+# Local dependencies and generated outputs that should not shape PR review.
+node_modules/
+**/node_modules/
+venv/
+**/venv/
+.venv/
+**/.venv/
+dist/
+**/dist/
+build/
+**/build/
+coverage/
+**/coverage/
+playwright-report/
+**/playwright-report/
+test-results/
+**/test-results/
+
+# Agent/tooling scratch state outside tracked repo skill files.
+.codex
+.codex/
+.codex/**
+.claude
+.claude/
+.claude/**

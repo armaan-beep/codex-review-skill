@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/install-repo-adapter [options]
+
+Install small wrapper scripts into a target repository. The wrappers locate the
+repo-local vendored skill first, then the global Codex skill.
+
+Options:
+  --repo DIR       Target repository. Default: current directory.
+  --force          Replace existing wrapper scripts.
+  -h, --help       Show help.
+EOF
+}
+
+repo_arg=.
+force=false
+helpers=(
+  codex-review
+  codex-review-pr-context
+  codex-review-comment
+  codex-review-fresh-worktree
+  codex-review-cleanup
+  crabbox-pr-proof
+  codex-review-preflight
+)
+
+require_value() {
+  local option=$1
+  local value=${2-}
+  if [[ -z "$value" || "$value" == --* ]]; then
+    echo "$option requires a value" >&2
+    exit 2
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo)
+      require_value "$1" "${2-}"
+      repo_arg=$2
+      shift 2
+      ;;
+    --force)
+      force=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ! -d "$repo_arg" ]]; then
+  echo "repo directory does not exist: $repo_arg" >&2
+  exit 1
+fi
+
+if repo_git_root=$(cd "$repo_arg" && git rev-parse --show-toplevel 2>/dev/null); then
+  repo_root=$repo_git_root
+else
+  repo_root=$(cd "$repo_arg" && pwd -P)
+fi
+scripts_dir="$repo_root/scripts"
+mkdir -p "$scripts_dir"
+
+write_wrapper() {
+  local name=$1
+  local target="$scripts_dir/$name"
+  local tmp
+
+  if [[ -e "$target" && "$force" != true ]]; then
+    echo "exists: $target; pass --force to replace" >&2
+    return 1
+  fi
+
+  tmp=$(mktemp)
+  cat > "$tmp" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+helper_name=$(basename "$0")
+script_dir=$(cd "$(dirname "$0")" && pwd -P)
+if repo_root=$(cd "$script_dir/.." && git rev-parse --show-toplevel 2>/dev/null); then
+  :
+elif repo_root=$(git rev-parse --show-toplevel 2>/dev/null); then
+  :
+else
+  repo_root=$(cd "$script_dir/.." && pwd -P)
+fi
+cd "$repo_root"
+
+candidates=()
+if [[ -n "${CODEX_REVIEW_SKILL_DIR:-}" ]]; then
+  candidates+=("$CODEX_REVIEW_SKILL_DIR")
+fi
+candidates+=("$repo_root/.agents/skills/codex-review")
+candidates+=("${CODEX_HOME:-$HOME/.codex}/skills/codex-review")
+candidates+=("$HOME/.codex/skills/codex-review")
+
+for skill_dir in "${candidates[@]}"; do
+  [[ -n "$skill_dir" ]] || continue
+  helper="$skill_dir/scripts/$helper_name"
+  if [[ -x "$helper" ]]; then
+    exec "$helper" "$@"
+  fi
+done
+
+echo "could not find executable codex-review helper for $helper_name" >&2
+echo "install the skill globally or vendor it at .agents/skills/codex-review" >&2
+exit 127
+EOF
+
+  mv "$tmp" "$target"
+  chmod +x "$target"
+  printf 'installed wrapper: %s\n' "$target"
+}
+
+for helper in "${helpers[@]}"; do
+  write_wrapper "$helper"
+done
+
+printf '\nRepo adapter installed in %s\n' "$scripts_dir"
+printf 'Commit these wrappers if you want agents and teammates to share the command surface.\n'

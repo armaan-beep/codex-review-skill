@@ -1,0 +1,782 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: codex-review [options]
+
+Options:
+  --mode auto|local|branch|commit
+                              Target selection. Default: auto.
+  --base REF                  Base ref for branch review. Default: PR base or origin/main.
+  --commit REF                Commit ref for commit review. Default: HEAD.
+  --codex-bin PATH            Codex binary. Default: codex.
+  --full-access               Run nested Codex review without sandbox/approval prompts.
+  --output FILE               Also save output to file.
+  --parallel-tests CMD        Run review and test command concurrently. Use "auto"
+                              for repo preflight or bundled fallback checks.
+  --github-comment            Post a GitHub PR audit comment after the review run.
+  --loop N                    Audit loop number for --github-comment.
+  --pr PR                     PR number, URL, or branch for --github-comment.
+  --allow-stale-base          Continue branch review if refreshing the base ref fails.
+  --dry-run                   Print selected commands, do not run.
+  -h, --help                  Show help.
+
+Modes:
+  local   codex review --uncommitted
+  branch  codex review --base <base>
+  commit  codex review --commit <commit>
+  auto    dirty tree -> local, else PR/current branch -> branch
+EOF
+}
+
+mode=auto
+base_ref=
+base_ref_explicit=false
+commit_ref=HEAD
+codex_bin=${CODEX_BIN:-codex}
+codex_args=()
+output=${CODEX_REVIEW_OUTPUT:-}
+parallel_tests=
+github_comment=false
+comment_loop=
+comment_pr=
+dry_run=false
+allow_stale_base=${CODEX_REVIEW_ALLOW_STALE_BASE:-false}
+if [[ "${CODEX_REVIEW_DISABLE_PLUGINS:-true}" == true ]]; then
+  codex_args+=(--disable plugins)
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)
+      mode=${2:-}
+      shift 2
+      ;;
+    --base)
+      base_ref=${2:-}
+      base_ref_explicit=true
+      shift 2
+      ;;
+    --commit)
+      commit_ref=${2:-}
+      shift 2
+      ;;
+    --codex-bin)
+      codex_bin=${2:-}
+      shift 2
+      ;;
+    --full-access)
+      codex_args+=(--dangerously-bypass-approvals-and-sandbox)
+      shift
+      ;;
+    --output)
+      output=${2:-}
+      shift 2
+      ;;
+    --parallel-tests)
+      parallel_tests=${2:-}
+      shift 2
+      ;;
+    --github-comment)
+      github_comment=true
+      shift
+      ;;
+    --loop)
+      comment_loop=${2:-}
+      shift 2
+      ;;
+    --pr)
+      comment_pr=${2:-}
+      shift 2
+      ;;
+    --allow-stale-base)
+      allow_stale_base=true
+      shift
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$mode" in
+  auto|local|branch|commit) ;;
+  *)
+    echo "invalid --mode: $mode" >&2
+    exit 2
+    ;;
+esac
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+
+repo_from_pr_url() {
+  local url=$1
+  if [[ "$url" =~ ^https?://github\.com/([^/]+)/([^/]+)/pull/[0-9]+ ]]; then
+    printf '%s/%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  fi
+  return 0
+}
+
+repo_key() {
+  local repo=${1%.git}
+  printf '%s\n' "$repo" | tr '[:upper:]' '[:lower:]'
+}
+
+repo_from_remote_url() {
+  local url=${1%.git}
+  if [[ "$url" =~ ^https?://([^/@]+@)?github\.com/([^/]+)/([^/]+)$ ]]; then
+    printf '%s/%s\n' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  elif [[ "$url" =~ ^git@github\.com:([^/]+)/([^/]+)$ ]]; then
+    printf '%s/%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  elif [[ "$url" =~ ^ssh://git@github\.com/([^/]+)/([^/]+)$ ]]; then
+    printf '%s/%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  fi
+  return 0
+}
+
+default_preflight_command() {
+  local base=${1-}
+  local helper
+  local helper_q
+  local base_q
+
+  if [[ -n "${CODEX_REVIEW_PREFLIGHT:-}" ]]; then
+    printf '%s\n' "$CODEX_REVIEW_PREFLIGHT"
+    return 0
+  fi
+
+  if [[ -x "$repo_root/scripts/preflight" ]]; then
+    helper="scripts/preflight"
+  elif [[ -x "$script_dir/codex-review-preflight" ]]; then
+    helper="$script_dir/codex-review-preflight"
+  else
+    return 1
+  fi
+
+  printf -v helper_q '%q' "$helper"
+  if [[ -n "$base" ]]; then
+    printf -v base_q '%q' "$base"
+    printf '%s --changed %s --quick\n' "$helper_q" "$base_q"
+  else
+    printf '%s --changed --quick\n' "$helper_q"
+  fi
+}
+
+commit_preflight_command() {
+  local commit=$1
+  local commit_q
+  local parent
+  local parent_q
+
+  printf -v commit_q '%q' "$commit"
+  if parent=$(git rev-parse --verify "$commit^" 2>/dev/null); then
+    printf -v parent_q '%q' "$parent"
+    printf 'git diff --check %s %s\n' "$parent_q" "$commit_q"
+  else
+    printf 'git show --check --format=medium %s >/dev/null\n' "$commit_q"
+  fi
+}
+
+remote_for_repo() {
+  local target_repo=$1
+  local target_key
+  local remote
+  local remote_url
+  local remote_repo
+
+  target_key=$(repo_key "$target_repo")
+  if remote_url=$(git remote get-url origin 2>/dev/null); then
+    remote_repo=$(repo_from_remote_url "$remote_url")
+    if [[ -n "$remote_repo" && "$(repo_key "$remote_repo")" == "$target_key" ]]; then
+      printf '%s\n' origin
+      return 0
+    fi
+  fi
+
+  while IFS= read -r remote; do
+    [[ -n "$remote" && "$remote" != origin ]] || continue
+    remote_url=$(git remote get-url "$remote" 2>/dev/null || true)
+    remote_repo=$(repo_from_remote_url "$remote_url")
+    if [[ -n "$remote_repo" && "$(repo_key "$remote_repo")" == "$target_key" ]]; then
+      printf '%s\n' "$remote"
+      return 0
+    fi
+  done < <(git remote 2>/dev/null || true)
+
+  return 1
+}
+
+current_branch=$(git branch --show-current 2>/dev/null || true)
+dirty=false
+if [[ -n "$(git status --porcelain)" ]]; then
+  dirty=true
+fi
+
+pr_url=
+base_fetch_remote=
+base_fetch_ref=
+base_fetch_source_ref=
+if [[ -z "$base_ref" && "$mode" != local ]] && command -v gh >/dev/null 2>&1; then
+  if [[ -n "$comment_pr" ]]; then
+    pr_lines=$(gh pr view "$comment_pr" --json baseRefName,url --jq '[.baseRefName, .url] | @tsv' 2>/dev/null || true)
+  else
+    pr_lines=$(gh pr view --json baseRefName,url --jq '[.baseRefName, .url] | @tsv' 2>/dev/null || true)
+  fi
+  if [[ -n "$pr_lines" ]]; then
+    base_name=${pr_lines%%$'\t'*}
+    pr_url=${pr_lines#*$'\t'}
+    if [[ -n "$base_name" ]]; then
+      base_repo=$(repo_from_pr_url "$pr_url")
+      if [[ -n "$base_repo" ]]; then
+        base_fetch_remote=$(remote_for_repo "$base_repo" || true)
+        if [[ -z "$base_fetch_remote" ]]; then
+          base_fetch_remote="https://github.com/$base_repo.git"
+        fi
+        base_fetch_source_ref="+refs/heads/$base_name"
+        base_fetch_ref="refs/codex-review/base/$base_name"
+        base_ref=$base_fetch_ref
+      else
+        base_ref="origin/$base_name"
+      fi
+    fi
+  fi
+fi
+
+if [[ -z "$base_ref" ]]; then
+  base_ref=origin/main
+fi
+
+review_kind=
+if [[ "$mode" == local || ( "$mode" == auto && "$dirty" == true ) ]]; then
+  review_kind=local
+elif [[ "$mode" == commit ]]; then
+  review_kind=commit
+elif [[ "$mode" == branch || ( "$mode" == auto && -n "$current_branch" && "$current_branch" != "main" ) ]]; then
+  review_kind=branch
+else
+  echo "no review target: clean main checkout and no forced mode" >&2
+  exit 1
+fi
+
+review_cmd=("$codex_bin")
+if (( ${#codex_args[@]} > 0 )); then
+  review_cmd+=("${codex_args[@]}")
+fi
+
+if [[ "$review_kind" == local ]]; then
+  review_cmd+=(review --uncommitted)
+elif [[ "$review_kind" == commit ]]; then
+  review_cmd+=(review --commit "$commit_ref")
+else
+  review_cmd+=(review --base "$base_ref")
+fi
+
+if [[ "$parallel_tests" == auto ]]; then
+  if [[ "$review_kind" == branch ]]; then
+    if ! parallel_tests=$(default_preflight_command "$base_ref"); then
+      parallel_tests=
+      echo "warning: no repo preflight or bundled fallback preflight helper found; skipping parallel tests" >&2
+    fi
+  elif [[ "$review_kind" == commit ]]; then
+    commit_oid=$(git rev-parse --verify "$commit_ref^{commit}")
+    head_oid=$(git rev-parse --verify HEAD)
+    if [[ "$commit_oid" == "$head_oid" ]] && git rev-parse --verify "$commit_oid^" >/dev/null 2>&1; then
+      if ! parallel_tests=$(default_preflight_command "$commit_oid^"); then
+        parallel_tests=$(commit_preflight_command "$commit_oid")
+      fi
+    else
+      parallel_tests=$(commit_preflight_command "$commit_oid")
+    fi
+  elif ! parallel_tests=$(default_preflight_command); then
+    parallel_tests=
+    echo "warning: no repo preflight or bundled fallback preflight helper found; skipping parallel tests" >&2
+  fi
+fi
+
+printf 'codex-review target: %s\n' "$review_kind"
+printf 'branch: %s\n' "${current_branch:-detached}"
+if [[ -n "$pr_url" ]]; then
+  printf 'pr: %s\n' "$pr_url"
+fi
+printf 'review:'
+printf ' %q' "${review_cmd[@]}"
+printf '\n'
+if [[ -n "$parallel_tests" ]]; then
+  printf 'tests: %s\n' "$parallel_tests"
+fi
+if [[ "$review_kind" == branch ]]; then
+  if [[ -n "$base_fetch_ref" ]]; then
+    printf 'fetch: git fetch %q %q\n' "$base_fetch_remote" "$base_fetch_source_ref:$base_fetch_ref"
+  elif [[ "$base_ref_explicit" == false || "$base_ref" == origin/* ]]; then
+    printf 'fetch: git fetch origin --quiet\n'
+  else
+    printf 'fetch: skipped for explicit base ref\n'
+  fi
+fi
+if [[ -n "$output" ]]; then
+  printf 'output: %s\n' "$output"
+fi
+if [[ "$github_comment" == true ]]; then
+  printf 'github_comment: enabled\n'
+fi
+
+if [[ "$dry_run" == true ]]; then
+  exit 0
+fi
+
+if [[ "$review_kind" == branch ]]; then
+  if [[ -n "$base_fetch_ref" ]]; then
+    git fetch --quiet "$base_fetch_remote" "$base_fetch_source_ref:$base_fetch_ref" || {
+      if [[ "$allow_stale_base" == true ]] && git rev-parse --verify --quiet "$base_fetch_ref" >/dev/null; then
+        echo "warning: git fetch $base_fetch_remote $base_fetch_source_ref failed; reviewing with existing $base_fetch_ref because --allow-stale-base was set" >&2
+      else
+        echo "error: git fetch $base_fetch_remote $base_fetch_source_ref failed; refusing to review against a stale base ref" >&2
+        if [[ "$allow_stale_base" == true ]]; then
+          echo "hint: --allow-stale-base requires an existing $base_fetch_ref ref" >&2
+        fi
+        exit 1
+      fi
+    }
+  elif [[ "$base_ref_explicit" == false || "$base_ref" == origin/* ]]; then
+    git fetch origin --quiet || {
+      if [[ "$allow_stale_base" == true ]]; then
+        echo "warning: git fetch origin failed; reviewing with existing refs because --allow-stale-base was set" >&2
+      else
+        echo "error: git fetch origin failed; refusing to review against a potentially stale base ref" >&2
+        echo "hint: retry with network access, pass --base <fresh-ref>, or pass --allow-stale-base explicitly" >&2
+        exit 1
+      fi
+    }
+  fi
+fi
+
+review_output=$output
+review_output_is_temp=false
+temp_files=()
+if [[ -z "$review_output" ]]; then
+  review_output=$(mktemp)
+  review_output_is_temp=true
+fi
+
+# shellcheck disable=SC2317,SC2329
+cleanup() {
+  if [[ "${review_output_is_temp:-false}" == true && -n "${review_output:-}" ]]; then
+    rm -f "$review_output"
+  fi
+  if (( ${#temp_files[@]} > 0 )); then
+    rm -f "${temp_files[@]}"
+  fi
+}
+trap cleanup EXIT
+
+run_review() {
+  mkdir -p "$(dirname "$review_output")"
+  CODEX_REVIEW_CHILD=1 "${review_cmd[@]}" 2>&1 | tee "$review_output"
+}
+
+elapsed_since() {
+  local started_at=$1
+  local finished_at
+  finished_at=$(date +%s)
+  printf '%s\n' "$((finished_at - started_at))"
+}
+
+format_elapsed() {
+  local seconds=$1
+  if (( seconds < 60 )); then
+    printf '%ss\n' "$seconds"
+  else
+    printf '%sm%ss\n' "$((seconds / 60))" "$((seconds % 60))"
+  fi
+}
+
+review_output_empty() {
+  [[ ! -s "$review_output" ]] || ! grep -q '[^[:space:]]' "$review_output"
+}
+
+review_output_result_window() {
+  local scan_lines
+  scan_lines=${CODEX_REVIEW_FINDING_SCAN_LINES:-200}
+  if [[ -s "$review_output" ]]; then
+    awk '
+      /^codex$/ {
+        buffer = ""
+        seen = 1
+        next
+      }
+      seen {
+        buffer = buffer $0 ORS
+      }
+      END {
+        if (!seen) {
+          exit 1
+        }
+        printf "%s", buffer
+      }
+    ' "$review_output" && return 0
+  fi
+  tail -n "$scan_lines" "$review_output"
+}
+
+review_output_single_line_window() {
+  review_output_result_window | tr -d '\n\r\t'
+  printf '\n'
+}
+
+review_output_structured_payload() {
+  command -v jq >/dev/null 2>&1 || return 1
+  local window
+  local json_candidate
+
+  window=$(review_output_result_window)
+  if printf '%s\n' "$window" | jq -e . >/dev/null 2>&1; then
+    printf '%s\n' "$window"
+    return 0
+  fi
+
+  json_candidate=$(printf '%s\n' "$window" | awk '
+    /^[[:space:]]*\{/ {
+      capture = 1
+    }
+    capture {
+      print
+    }
+  ')
+  [[ -n "$json_candidate" ]] || return 1
+  printf '%s\n' "$json_candidate" | jq -e . >/dev/null 2>&1 || return 1
+  printf '%s\n' "$json_candidate"
+}
+
+review_output_has_json_findings_fallback() {
+  review_output_single_line_window | grep -Eiq '"findings"[[:space:]]*:[[:space:]]*\[[[:space:]]*\{'
+}
+
+review_output_has_priority_findings_fallback() {
+  review_output_result_window | awk '
+    /^[[:space:]]*(#+[[:space:]]*)?(Findings|Accepted findings|Actionable findings|Full review comments|Review comments):?[[:space:]]*$/ {
+      section = "findings"
+      next
+    }
+    /^[[:space:]]*(#+[[:space:]]*)?(Rejected|Rejected findings|Rejected candidate|Rejected candidates|Non-actionable|Verification|Tests|CI|Summary|Open questions):?[[:space:]]*$/ {
+      section = ""
+      next
+    }
+    section == "findings" && /\[P[0-3]\]/ {
+      found = 1
+    }
+    END {
+      exit found ? 0 : 1
+    }
+  '
+}
+
+review_output_structured_findings_count() {
+  command -v jq >/dev/null 2>&1 || return 1
+  review_output_structured_payload | jq -er '
+    if type == "object" and (.findings | type) == "array" then
+      (.findings | length)
+    else
+      empty
+    end
+  ' 2>/dev/null
+}
+
+review_output_structured_findings_table() {
+  command -v jq >/dev/null 2>&1 || return 1
+  review_output_structured_payload | jq -er --arg repo_root "$repo_root" '
+    def clean_text:
+      tostring
+      | gsub("\r|\n"; " ")
+      | gsub("\\|"; "\\\\|");
+    def repo_path:
+      tostring
+      | if . == $repo_root then
+          "."
+        elif startswith($repo_root + "/") then
+          .[($repo_root | length) + 1:]
+        else
+          .
+        end
+      | sub("^\\./"; "");
+    def priority:
+      if .priority != null then
+        "P" + (.priority | tostring)
+      elif ((.title // "") | test("\\[P[0-3]\\]")) then
+        ((.title // "") | capture("\\[(?<p>P[0-3])\\]").p)
+      else
+        "P?"
+      end;
+    def location:
+      ((.code_location.absolute_file_path // .file // .path // "unknown") | repo_path)
+      + if (.code_location.line_range.start // .line // null) != null then
+          ":" + ((.code_location.line_range.start // .line) | tostring)
+        else
+          ""
+        end;
+    if type == "object" and (.findings | type) == "array" and (.findings | length) > 0 then
+      "| Priority | Location | Title |\n| --- | --- | --- |\n"
+      + (.findings | map("| " + priority + " | `" + (location | clean_text) + "` | " + (((.title // "untitled") | sub("^\\[P[0-3]\\][[:space:]]*"; "")) | clean_text) + " |") | join("\n"))
+    else
+      empty
+    end
+  ' 2>/dev/null
+}
+
+review_output_has_structured_findings() {
+  local count
+  count=$(review_output_structured_findings_count) || return 1
+  [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]
+}
+
+review_output_reports_structured_clean() {
+  command -v jq >/dev/null 2>&1 || return 1
+  review_output_structured_payload | jq -e '
+    type == "object"
+    and (.findings == [])
+    and (((.overall_correctness // "") | tostring | ascii_downcase) == "patch is correct")
+  ' >/dev/null 2>&1
+}
+
+review_output_reports_json_clean_fallback() {
+  local window
+  window=$(review_output_single_line_window)
+  printf '%s\n' "$window" | grep -Eiq '"findings"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' &&
+    printf '%s\n' "$window" | grep -Eiq '"overall_correctness"[[:space:]]*:[[:space:]]*"patch is correct"'
+}
+
+review_output_has_findings() {
+  review_output_has_structured_findings ||
+    review_output_has_json_findings_fallback ||
+    review_output_has_priority_findings_fallback
+}
+
+review_output_reports_clean() {
+  review_output_reports_structured_clean ||
+    review_output_reports_json_clean_fallback ||
+    review_output_result_window | grep -Eiq \
+      '(^|[^[:alpha:]])(no findings|no actionable|no accepted/actionable findings|found no actionable correctness issues|no functional code changes|does not introduce( any)? functional code|does not introduce[^.]*observable (breakage|regressions)|no identifiable correctness issues|did not find any discrete|did not find any actionable|did not identify any discrete|did not identify any actionable|no correctness, security, or maintainability issues)'
+}
+
+post_github_comment() {
+  local phase_status=$1
+  local body_file
+  local helper
+  local review_output_bytes
+  local review_output_comment_limit
+  local review_output_include_raw
+  local structured_count
+  local structured_table
+  body_file=$(mktemp)
+  helper="$repo_root/scripts/codex-review-comment"
+  if [[ ! -x "$helper" && -x "$script_dir/codex-review-comment" ]]; then
+    helper="$script_dir/codex-review-comment"
+  fi
+  review_output_comment_limit=${CODEX_REVIEW_COMMENT_OUTPUT_LIMIT:-12000}
+  review_output_include_raw=${CODEX_REVIEW_COMMENT_INCLUDE_RAW:-false}
+
+  {
+    printf "Review target: \`%s\`\n\n" "$review_kind"
+    printf 'Review command:\n\n```bash\n'
+    printf '%q ' "${review_cmd[@]}"
+    printf '\n```\n\n'
+    if [[ -n "$parallel_tests" ]]; then
+      printf "Parallel tests:\n\n\`\`\`bash\n%s\n\`\`\`\n\n" "$parallel_tests"
+      printf "Test exit: \`%s\`\n\n" "${tests_status:-unknown}"
+    fi
+    printf "Review exit: \`%s\`\n\n" "${review_status:-unknown}"
+
+    if [[ -s "$review_output" ]]; then
+      review_output_bytes=$(wc -c < "$review_output" | tr -d '[:space:]')
+      printf "Review output: captured \`%s bytes\`.\n\n" "$review_output_bytes"
+      printf "Finding markers in review result window:\n\n"
+      if [[ "$phase_status" == clean ]]; then
+        printf -- "- none reported by final review result\n"
+      else
+        structured_table=$(review_output_structured_findings_table 2>/dev/null || true)
+        if [[ -n "$structured_table" ]]; then
+          printf "Structured findings:\n\n%s\n\n" "$structured_table"
+        fi
+        review_output_result_window | awk '
+          /\[P[0-3]\]/ {
+            line = $0
+            if (length(line) > 320) {
+              line = substr(line, 1, 320) " [line truncated]"
+            }
+            printf "- line %d: %s\n", NR, line
+            count++
+            if (count == 40) {
+              truncated = 1
+              exit
+            }
+          }
+          END {
+            if (count == 0) {
+              print "- none found in captured output"
+            } else if (truncated) {
+              print "- additional finding markers omitted"
+            }
+          }
+        '
+        structured_count=$(review_output_structured_findings_count 2>/dev/null || true)
+        if [[ "${structured_count:-}" =~ ^[0-9]+$ && "$structured_count" -gt 0 ]]; then
+          printf -- "- structured findings array: %s item(s)\n" "$structured_count"
+        fi
+      fi
+      printf '\n'
+
+      if [[ "$review_output_include_raw" == true ]]; then
+        printf '<details><summary>Raw review output</summary>\n\n```text\n'
+        if [[ "$review_output_bytes" =~ ^[0-9]+$ && "$review_output_bytes" -gt "$review_output_comment_limit" ]]; then
+          tail -c "$review_output_comment_limit" "$review_output"
+          printf '\n\n[review output truncated: %s bytes total, showing last %s bytes]\n' "$review_output_bytes" "$review_output_comment_limit"
+        else
+          cat "$review_output"
+        fi
+        printf '\n```\n\n</details>\n'
+      else
+        printf "_Raw review output omitted to keep the audit trail readable. Set \`%s\` to include a truncated raw output section._\n" "CODEX_REVIEW_COMMENT_INCLUDE_RAW=true"
+      fi
+    else
+      printf 'Review output: no output captured.\n'
+    fi
+  } > "$body_file"
+
+  if [[ -x "$helper" ]]; then
+    args=(--phase review --status "$phase_status" --title "Review run" --body-file "$body_file")
+    if [[ -n "$comment_loop" ]]; then
+      args+=(--loop "$comment_loop")
+    fi
+    if [[ -n "$comment_pr" ]]; then
+      args+=(--pr "$comment_pr")
+    fi
+    if [[ "${CODEX_REVIEW_COMMENT_DRY_RUN:-false}" == true ]]; then
+      args+=(--dry-run)
+    fi
+    "$helper" "${args[@]}"
+  else
+    echo "warning: cannot post GitHub comment; helper missing at $helper" >&2
+  fi
+
+  rm -f "$body_file"
+}
+
+post_review_report_comment() {
+  local report_status=$1
+  if [[ "$report_status" == 0 ]]; then
+    post_github_comment clean
+  elif review_output_has_findings; then
+    post_github_comment findings
+  else
+    post_github_comment failed
+  fi
+}
+
+report_clean_review_or_fail() {
+  local elapsed_text
+  elapsed_text=$(format_elapsed "${review_elapsed_seconds:-0}")
+
+  if review_output_has_findings; then
+    printf 'codex-review complete after %s\n' "$elapsed_text"
+    printf 'codex-review findings: accepted/actionable findings reported\n'
+    return 1
+  fi
+  if review_output_reports_clean; then
+    printf 'codex-review complete after %s\n' "$elapsed_text"
+    printf 'codex-review clean: no accepted/actionable findings reported\n'
+    return 0
+  fi
+  if review_output_empty; then
+    printf 'codex-review complete after %s; no output\n' "$elapsed_text"
+    return 1
+  fi
+  printf 'codex-review complete after %s\n' "$elapsed_text"
+  printf 'codex-review failed: review output did not contain findings or an explicit clean result\n'
+  return 1
+}
+
+if [[ -z "$parallel_tests" ]]; then
+  review_started_at=$(date +%s)
+  set +e
+  run_review
+  review_status=$?
+  review_elapsed_seconds=$(elapsed_since "$review_started_at")
+  set -e
+  if [[ "$review_status" == 0 ]]; then
+    set +e
+    report_clean_review_or_fail
+    report_status=$?
+    set -e
+    if [[ "$github_comment" == true ]]; then
+      post_review_report_comment "$report_status"
+    fi
+    exit "$report_status"
+  fi
+  if [[ "$github_comment" == true ]]; then
+    post_github_comment failed
+  fi
+  exit "$review_status"
+fi
+
+review_status_file=$(mktemp)
+review_elapsed_file=$(mktemp)
+tests_status_file=$(mktemp)
+temp_files+=("$review_status_file" "$review_elapsed_file" "$tests_status_file")
+
+(
+  set +e
+  review_started_at=$(date +%s)
+  run_review
+  status=$?
+  elapsed=$(elapsed_since "$review_started_at")
+  printf '%s\n' "$status" > "$review_status_file"
+  printf '%s\n' "$elapsed" > "$review_elapsed_file"
+) &
+review_pid=$!
+
+(
+  set +e
+  bash -lc "$parallel_tests"
+  status=$?
+  printf '%s\n' "$status" > "$tests_status_file"
+) &
+tests_pid=$!
+
+wait "$review_pid" || true
+wait "$tests_pid" || true
+
+review_status=$(cat "$review_status_file")
+review_elapsed_seconds=$(cat "$review_elapsed_file")
+tests_status=$(cat "$tests_status_file")
+rm -f "$review_status_file" "$review_elapsed_file" "$tests_status_file"
+temp_files=()
+
+printf 'codex-review exit: %s\n' "$review_status"
+printf 'tests exit: %s\n' "$tests_status"
+
+if [[ "$review_status" != 0 || "$tests_status" != 0 ]]; then
+  if [[ "$github_comment" == true ]]; then
+    post_github_comment failed
+  fi
+  exit 1
+fi
+
+set +e
+report_clean_review_or_fail
+report_status=$?
+set -e
+if [[ "$github_comment" == true ]]; then
+  post_review_report_comment "$report_status"
+fi
+exit "$report_status"

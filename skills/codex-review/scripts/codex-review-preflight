@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: codex-review-preflight [options] [paths...]
+
+Run conservative generic checks for repositories that have not installed their
+own scripts/preflight helper. This fallback intentionally avoids guessing a
+project's full test suite.
+
+Options:
+  --changed [BASE]  Check files changed against BASE. Default BASE is origin/main
+                    when available, otherwise HEAD~1 or HEAD.
+  --all             Check the full repository where generic checks apply.
+  --quick           Accepted for compatibility; generic fallback is always quick.
+  --dry-run         Print selected commands without running them.
+  -h, --help        Show help.
+
+Examples:
+  codex-review-preflight --changed --dry-run
+  codex-review-preflight --changed origin/main
+EOF
+}
+
+repo_root=$(git rev-parse --show-toplevel)
+repo_root=$(cd "$repo_root" && pwd -P)
+cd "$repo_root"
+
+mode=paths
+base_ref=
+all=false
+dry_run=false
+paths=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --changed)
+      mode=changed
+      if [[ -n "${2-}" && "$2" != --* ]]; then
+        base_ref=$2
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --all)
+      all=true
+      mode=all
+      shift
+      ;;
+    --quick)
+      shift
+      ;;
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      paths+=("$@")
+      break
+      ;;
+    --*)
+      usage >&2
+      exit 2
+      ;;
+    *)
+      paths+=("$1")
+      shift
+      ;;
+  esac
+done
+
+resolve_default_base() {
+  if git rev-parse --verify --quiet origin/main >/dev/null; then
+    printf 'origin/main\n'
+  elif git rev-parse --verify --quiet HEAD~1 >/dev/null; then
+    printf 'HEAD~1\n'
+  else
+    printf 'HEAD\n'
+  fi
+}
+
+collect_changed_paths() {
+  local base=$1
+  {
+    if git merge-base "$base" HEAD >/dev/null 2>&1; then
+      git diff --name-only "$base"...HEAD 2>/dev/null || true
+    else
+      git diff --name-only "$base" HEAD 2>/dev/null || true
+    fi
+    git diff --name-only --cached
+    git diff --name-only
+    git ls-files --others --exclude-standard
+  } | sed '/^[[:space:]]*$/d' | sort -u
+}
+
+diff_check_command() {
+  local base=${1-}
+  local base_q
+
+  if [[ -z "$base" || "$base" == HEAD ]]; then
+    printf 'git diff --check --cached && git diff --check\n'
+    return 0
+  fi
+
+  printf -v base_q '%q' "$base"
+  if git merge-base "$base" HEAD >/dev/null 2>&1; then
+    printf 'git diff --check %s...HEAD && git diff --check --cached && git diff --check\n' "$base_q"
+  else
+    printf 'git diff --check %s HEAD && git diff --check --cached && git diff --check\n' "$base_q"
+  fi
+}
+
+scoped_files_assignment() {
+  local file
+  local file_q
+
+  if (( $# == 0 )); then
+    cat <<'EOF'
+files=()
+while IFS= read -r -d '' file; do
+  files+=("$file")
+done < <(git ls-files --others --exclude-standard -z)
+EOF
+    return 0
+  fi
+
+  printf 'files=('
+  for file in "$@"; do
+    printf -v file_q '%q' "$file"
+    printf ' %s' "$file_q"
+  done
+  printf ' )\n'
+}
+
+untracked_whitespace_command() {
+  scoped_files_assignment "$@"
+  cat <<'EOF'
+tmp=$(mktemp)
+whitespace_status=0
+
+for file in "${files[@]}"; do
+  [[ -f "$file" ]] || continue
+  if git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+    continue
+  fi
+  text_file=false
+
+  case "$file" in
+    *.bash|*.cjs|*.css|*.env|*.env.*|*.html|*.ini|*.js|*.json|*.jsonl|*.jsx|*.lock|*.md|*.mdx|*.mjs|*.py|*.pyi|*.scss|*.sh|*.sql|*.tf|*.tfvars|*.toml|*.ts|*.tsx|*.txt|*.xml|*.yaml|*.yml|*/Dockerfile|Dockerfile|*/Makefile|Makefile|*/README|README|*/README.*|README.*|*/LICENSE|LICENSE|*/LICENSE.*|LICENSE.*)
+      text_file=true
+      ;;
+    *)
+      first_line=$(head -n 1 "$file" 2>/dev/null || true)
+      case "$first_line" in
+        '#!'*) text_file=true ;;
+      esac
+      ;;
+  esac
+
+  [[ "$text_file" == true ]] || continue
+  git diff --check --no-index /dev/null "$file" >"$tmp" 2>&1 || true
+  if [[ -s "$tmp" ]]; then
+    cat "$tmp"
+    whitespace_status=1
+    : >"$tmp"
+  fi
+done
+
+rm -f "$tmp"
+exit "$whitespace_status"
+EOF
+}
+
+shell_syntax_command() {
+  if (( $# == 0 )); then
+    cat <<'EOF'
+files=()
+while IFS= read -r -d '' file; do
+  files+=("$file")
+done < <({
+  git ls-files -z
+  git ls-files --others --exclude-standard -z
+})
+EOF
+  else
+    scoped_files_assignment "$@"
+  fi
+  cat <<'EOF'
+shell_status=0
+
+for file in "${files[@]}"; do
+  [[ -f "$file" ]] || continue
+  first_line=$(head -n 1 "$file" 2>/dev/null || true)
+  check_file=false
+
+  case "$file" in
+    *.sh|*.bash) check_file=true ;;
+  esac
+
+  case "$first_line" in
+    '#!'*bash*|'#!'*'/sh'*) check_file=true ;;
+  esac
+
+  if [[ "$check_file" == true ]]; then
+    bash -n "$file" || shell_status=1
+  fi
+done
+
+exit "$shell_status"
+EOF
+}
+
+detect_project_hints() {
+  local hints=()
+
+  if [[ -f package.json ]]; then
+    hints+=("JavaScript/TypeScript project detected: add a repo-specific scripts/preflight that runs lint, typecheck, and tests.")
+  fi
+  if [[ -f pyproject.toml || -f requirements.txt || -f setup.py ]]; then
+    hints+=("Python project detected: add a repo-specific scripts/preflight that runs lint/type/test commands.")
+  fi
+  if [[ -f go.mod ]]; then
+    hints+=("Go project detected: add a repo-specific scripts/preflight that runs go test ./....")
+  fi
+  if [[ -f Cargo.toml ]]; then
+    hints+=("Rust project detected: add a repo-specific scripts/preflight that runs cargo test and cargo clippy.")
+  fi
+
+  if (( ${#hints[@]} > 0 )); then
+    printf '%s\n' "${hints[@]}"
+  fi
+}
+
+if [[ "$all" == true ]]; then
+  paths=()
+  while IFS= read -r path; do
+    paths+=("$path")
+  done < <(git ls-files)
+elif [[ "$mode" == changed || ${#paths[@]} == 0 ]]; then
+  mode=changed
+  base_ref=${base_ref:-$(resolve_default_base)}
+  paths=()
+  while IFS= read -r path; do
+    paths+=("$path")
+  done < <(collect_changed_paths "$base_ref")
+fi
+
+commands=()
+commands+=("$(diff_check_command "${base_ref:-}")")
+if (( ${#paths[@]} > 0 )); then
+  commands+=("$(untracked_whitespace_command "${paths[@]}")")
+  commands+=("$(shell_syntax_command "${paths[@]}")")
+elif [[ "$mode" == all ]]; then
+  commands+=("$(untracked_whitespace_command)")
+  commands+=("$(shell_syntax_command)")
+else
+  commands+=("printf 'no changed paths for generic file checks\n'")
+fi
+
+if [[ "$dry_run" == true ]]; then
+  printf 'preflight mode: %s\n' "$mode"
+  if [[ -n "${base_ref:-}" ]]; then
+    printf 'base: %s\n' "$base_ref"
+  fi
+  if (( ${#paths[@]} > 0 )); then
+    printf 'paths:\n'
+    printf -- '- %s\n' "${paths[@]}"
+  fi
+  printf 'commands:\n'
+  printf -- '- %s\n' "${commands[@]}"
+  hint_text=$(detect_project_hints)
+  if [[ -n "$hint_text" ]]; then
+    printf 'hints:\n'
+    printf '%s\n' "$hint_text" | sed 's/^/- /'
+  fi
+  exit 0
+fi
+
+for command in "${commands[@]}"; do
+  printf '\n$ %s\n' "$command"
+  bash -lc "$command"
+done
+
+hint_text=$(detect_project_hints)
+if [[ -n "$hint_text" ]]; then
+  printf '\npreflight hints:\n'
+  printf '%s\n' "$hint_text" | sed 's/^/- /'
+fi
